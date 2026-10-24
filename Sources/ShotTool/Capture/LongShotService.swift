@@ -511,130 +511,67 @@ enum LongShotService {
         plannedOverlaps: [Int]? = nil,
         expectedOverlap: Int? = nil
     ) -> CGImage? {
-        stitchOnce(frames, plannedOverlaps: plannedOverlaps, expectedOverlap: expectedOverlap)
+        guard !frames.isEmpty else { return nil }
+        if frames.count == 1 { return frames[0] }
+
+        if let plannedOverlaps, plannedOverlaps.count == frames.count - 1 {
+            let alignments = zip(frames.dropLast(), plannedOverlaps).map { frame, planned in
+                let overlap = max(0, min(planned, frame.height - 1))
+                return FrameMatcher.Alignment(nextContentStart: 0, overlap: overlap, score: 0, margin: 1)
+            }
+            return FrameStitcher.stitch(frames, alignments: alignments)
+        }
+
+        let alignments = (1..<frames.count).map { index -> FrameMatcher.Alignment in
+            let prev = frames[index - 1]
+            let next = frames[index]
+            let expNew: Int? = {
+                if let expectedOverlap {
+                    return prev.height - expectedOverlap
+                }
+                if let bandOverlap = findOverlapBand(upper: prev, lower: next) {
+                    return prev.height - bandOverlap
+                }
+                return nil
+            }()
+            return FrameMatcher.alignment(previous: prev, next: next, expectedNewContent: expNew)
+        }
+
+        return FrameStitcher.stitch(frames, alignments: alignments)
     }
 
-    private static func stitchOnce(
-        _ frames: [CGImage],
-        plannedOverlaps: [Int]?,
-        expectedOverlap: Int?
-    ) -> CGImage? {
-        guard let first = frames.first else { return nil }
-        let width = first.width
+    private static func findOverlapBand(upper: CGImage, lower: CGImage) -> Int? {
+        guard let ga = grayscale(upper), let gb = grayscale(lower), ga.width == gb.width else { return nil }
+        let width = ga.width
+        let bandHeight = min(160, upper.height / 2)
+        guard bandHeight > 8 else { return nil }
+        let maxSearch = lower.height - bandHeight
+        guard maxSearch > 2 else { return nil }
+        let bandTop = upper.height - bandHeight
+        let step = 4
+        let columns = Array(stride(from: 0, to: width, by: step))
 
-        // 每帧相对上一帧的重叠高度
-        // 上一段匹配出来的重叠。用户滚动速度是稳定的，
-        // 所以某段匹配失败时，沿用上一段的结果远比「帧高一半」这种瞎猜靠谱。
-        var previousOverlap: Int? = expectedOverlap
-        var overlaps: [Int] = []
-        for index in 1..<frames.count {
-            guard let upper = grayscale(frames[index - 1]),
-                  let lower = grayscale(frames[index]) else { return nil }
+        var bestOffset = -1
+        var bestScore = Int.max
 
-            // 搜索上限要覆盖「几乎整屏重叠」的情况。
-            // 原来取 `帧高 * 3/4`，但用户小幅滚动时重叠可以到 94%（实测 986/1050），
-            // 真实位置落在 836 行、而上限只有 787 —— **根本搜不到，必然匹配失败**。
-            // 这就是「日志里 6 段未匹配上、结果整段重复」的直接原因。
-            let maxSearch = max(60, upper.height - 20)
-            // 这一段的目标重叠：优先用实测滚动量，其次用统一推算值。
-            // -1 是「辅助功能翻页、滚动量未知」的标记，走全范围搜索。
-            // 优先级：实测滚动量 > 上一段的重叠 > 理论值
-            let hint: Int? = {
-                if let plannedOverlaps, index - 1 < plannedOverlaps.count {
-                    let value = plannedOverlaps[index - 1]
-                    if value >= 0 { return value }
+        for offset in 0...maxSearch {
+            var score = 0
+            var row = 0
+            while row < bandHeight {
+                let upperRow = (bandTop + row) * width
+                let lowerRow = (offset + row) * width
+                for column in columns {
+                    score += abs(Int(ga.pixels[upperRow + column]) - Int(gb.pixels[lowerRow + column]))
                 }
-                return previousOverlap
-            }()
-
-            // 匹配成功就用匹配值（修正小误差），匹配不上就用滚动量算出来的值（不中断拼接）；
-            // 连滚动量都没有（AX 翻页）就取帧高一半当保守值，无论如何不在这里失败。
-            var matched: Int? = nil
-
-            // ① 相位相关优先（业界标准，参考 screen-stitch 的算法链）。
-            //    它直接从像素算位移，不受滚动量单位换算影响；
-            //    PSR + NCC 双重验证挡掉假峰值。
-            if let shift = PhaseCorrelator.verticalShift(
-                prevPixels: upper.pixels,
-                nextPixels: lower.pixels,
-                width: upper.width,
-                height: min(upper.height, lower.height),
-                maxShift: upper.height - 32
-            ) {
-                let candidate = upper.height - shift
-                let score = normalizedCrossCorrelation(
-                    upper: upper, lower: lower, overlap: candidate
-                )
-                if candidate > 24 && candidate < upper.height - 8 && score > 0.45 {
-                    matched = candidate
-                }
+                if score > bestScore { break }
+                row += 1
             }
-
-            // ② 相位相关拿不到时，用实测滚动量做中心微调
-            //    （滚动量可能因设备单位有偏差，所以只做参考不做主）
-            if matched == nil, let hint, hint > 0 {
-                matched = findOverlapRobust(
-                    upper: upper,
-                    lower: lower,
-                    maxSearch: maxSearch,
-                    expected: hint
-                )
+            if score < bestScore {
+                bestScore = score
+                bestOffset = offset
             }
-
-            // ③ 都不行，退回无先验的模板匹配
-            if matched == nil {
-                matched = findOverlapRobust(
-                    upper: upper,
-                    lower: lower,
-                    maxSearch: maxSearch,
-                    expected: nil
-                )
-            }
-
-            let fallback = lower.height / 2
-            let rawOverlap = matched ?? hint ?? fallback
-
-            // 一定要夹在合法区间内。否则某一段算出越界值（比如恰好等于帧高），
-            // 后面的 `guard overlap < upper.height - 8` 会让**整个拼接**放弃，
-            // 实测 8 帧时就是这样触发的（4 帧那次没问题）。
-            let overlap = max(24, min(rawOverlap, upper.height - 24))
-            if let matched {
-                previousOverlap = matched
-            } else {
-                NSLog("[ShotTool] 第 \(index) 段未匹配上，沿用重叠 \(overlap)px")
-            }
-            // 重叠太大（说明几乎没滚动）或太小（说明漏了内容）都不可靠
-            // 已 clamp 到 [24, upper.height-24]，这里不再让单段拖垮整体
-            overlaps.append(overlap)
         }
-
-        // 总高度
-        var totalHeight = first.height
-        for (index, frame) in frames.enumerated() where index > 0 {
-            totalHeight += frame.height - overlaps[index - 1]
-        }
-
-        guard let ctx = CGContext(
-            data: nil,
-            width: width,
-            height: totalHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-
-        // 不翻转坐标系：CGImage 直接 draw 是正立的，
-        // 第 i 帧「从顶部算的偏移」换算成左下原点的 y。
-        var topOffset = 0
-        for (index, frame) in frames.enumerated() {
-            if index > 0 {
-                topOffset += frames[index - 1].height - overlaps[index - 1]
-            }
-            let y = totalHeight - topOffset - frame.height
-            ctx.draw(frame, in: CGRect(x: 0, y: y, width: width, height: frame.height))
-        }
-
-        return ctx.makeImage()
+        guard bestOffset >= 0 else { return nil }
+        return bestOffset + bandHeight
     }
 }

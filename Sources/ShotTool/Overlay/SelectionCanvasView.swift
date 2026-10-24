@@ -134,12 +134,8 @@ final class SelectionCanvasView: NSView {
         coordinator?.updateHover(at: globalPoint(event))
     }
 
-    /// 长截图时滚动事件先到遮罩：记录滚动量，再转发给下面的页面。
-    /// 这是 iShot 的做法（`-[MXClipView scrollWheel:]` 里累积 deltaY + `handleMouseEvent:` 转发），
-    /// 好处是滚动量是**真实发生**的，不靠估算。
     override func scrollWheel(with event: NSEvent) {
         if coordinator?.session?.isLongShot == true {
-            coordinator?.handleLongShotScroll(event)
             return
         }
         super.scrollWheel(with: event)
@@ -150,9 +146,9 @@ final class SelectionCanvasView: NSView {
         if coordinator?.session?.isLongShot == true {
             switch Int(event.keyCode) {
             case 53:
-                coordinator?.longShotController?.cancel()
+                coordinator?.cancelLongShot()
             case 36, 76:
-                coordinator?.longShotController?.finish()
+                coordinator?.finishLongShot()
             default:
                 break
             }
@@ -302,7 +298,6 @@ final class SelectionCanvasView: NSView {
         if session.isLongShot {
             if let selection {
                 drawLongShotFrame(ctx, selection: selection)
-                drawLongShotHint(ctx, selection: selection)
             }
             toolbar = nil
             return
@@ -419,48 +414,6 @@ final class SelectionCanvasView: NSView {
         ctx.setStrokeColor(CGColor(gray: 1, alpha: 0.95))
         ctx.setLineWidth(1.5)
         ctx.stroke(selection.insetBy(dx: 0.75, dy: 0.75))
-    }
-
-    /// 长截图模式的提示条。
-    /// 遮罩是穿透的（用户要能滚到下面的内容），所以**不能用可点击按钮**，只做展示；
-    /// 完成靠回车，取消靠 Esc。
-    private func drawLongShotHint(_ ctx: CGContext, selection: CGRect) {
-        guard let text = coordinator?.longShotController?.statusText else { return }
-
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: NSColor.white,
-        ]
-        let textSize = (text as NSString).size(withAttributes: attributes)
-        let padding: CGFloat = 10
-        let barWidth = textSize.width + padding * 2
-        let barHeight: CGFloat = 24
-
-        // 默认放在选区上方外侧；顶部放不下就挪到下方
-        var rect = CGRect(
-            x: selection.maxX - barWidth,
-            y: selection.minY - barHeight - 8,
-            width: barWidth,
-            height: barHeight
-        )
-        if rect.minY < 2 {
-            rect.origin.y = selection.maxY + 8
-        }
-
-        let path = CGPath(
-            roundedRect: rect,
-            cornerWidth: 6,
-            cornerHeight: 6,
-            transform: nil
-        )
-        ctx.addPath(path)
-        ctx.setFillColor(CGColor(gray: 0, alpha: 0.82))
-        ctx.fillPath()
-
-        (text as NSString).draw(
-            at: CGPoint(x: rect.minX + padding, y: rect.minY + (barHeight - textSize.height) / 2),
-            withAttributes: attributes
-        )
     }
 
     // MARK: - 标注

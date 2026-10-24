@@ -117,7 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 方案 B 的滚动由用户真实滚动驱动，脚本没法模拟（注入的滚动不是真实事件，
             // 也正好是我们放弃的那条路），所以这里不做滚动模拟。
             DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) {
-                OverlayCoordinator.shared.longShotController?.cancel()
+                OverlayCoordinator.shared.cancelLongShot()
             }
         }
 

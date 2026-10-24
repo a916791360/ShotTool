@@ -71,17 +71,9 @@ final class OverlayCoordinator {
     private(set) var isActive = false
     private(set) var annotations = AnnotationStore()
 
-    /// 长截图期间由它接管交互，结束后置空
-    private(set) var longShotController: LongShotController?
-    /// 长截图时轮询鼠标位置判断是否停在按钮上。
-    ///
-    /// 用轮询而不是 mouseMoved 事件：实测在遮罩这个 `.screenSaver` 层级的 borderless 窗口上，
-    /// 鼠标停在**子视图按钮**上时 mouseMoved 拿不到（tracking area 和局部监听都失灵）。
-    /// 轮询 60ms 一次，开销可以忽略，但不依赖任何事件分发。
-    private var longShotHoverTimer: Timer?
-    private var lastLongShotHover: Bool?
-    private var outsideTicks = 0
-    /// 长截图期间的全局滚动监听（遮罩穿透后靠它记账）
+    /// 长截图新引擎及交互悬浮条
+    private var longCaptureService: LongCaptureService?
+    private var longShotHUDController: LongShotHUDController?
     private var globalScrollMonitor: Any?
 
     /// 结束回调：成功给出裁剪后的图，取消给 nil
@@ -175,6 +167,10 @@ final class OverlayCoordinator {
         guard isActive else { return }
         isActive = false
         session = nil
+        longShotHUDController?.close()
+        longShotHUDController = nil
+        longCaptureService?.cancel()
+        longCaptureService = nil
         removeGlobalScrollMonitor()
 
         for window in windows {
@@ -465,158 +461,123 @@ final class OverlayCoordinator {
 
     func startLongShot() {
         guard let session, let selection = session.selection else { return }
-        let pixelScale = scale
 
-        guard LongShotService.hasAccessibility() else {
-            teardown()
-            promptAccessibility()
-            onFinish?(nil)
+        // 1. 查找选区中心所在的屏幕与 displayID
+        let center = CGPoint(x: selection.midX, y: selection.midY)
+        let screen = ScreenGeometry.screen(containing: center) ?? NSScreen.main ?? NSScreen.screens[0]
+        let displayID = screen.displayID
+
+        // 2. 获取该屏幕初始的截屏图像作为首屏 fallback
+        guard let displayFrame = frames[displayID] else {
+            NSLog("[ShotTool] 无法获取显示器 \(displayID) 的首屏帧")
+            cancel()
             return
         }
 
-        // 关键：不 teardown。
-        // iShot 的做法是保留遮罩视图、把窗口背景设透明，然后把按钮 addSubview 到遮罩上。
-        // 新建窗口在「应用没有任何自己的窗口」的状态下不会上屏，这条弯路已经走过。
-        session.isLongShot = true
-        NSLog("[ShotTool] 长截图模式，选区 \(Int(selection.width))x\(Int(selection.height))pt")
+        // 3. 计算选区在当前显示器局部的 CG 坐标（左上角原点）
+        let screenRect = ScreenGeometry.cgRect(of: screen)
+        let localSelection = CGRect(
+            x: selection.minX - screenRect.minX,
+            y: selection.minY - screenRect.minY,
+            width: selection.width,
+            height: selection.height
+        )
 
-        let controller = LongShotController(selection: selection, scale: pixelScale)
-        controller.onChange = { [weak self] in
-            self?.refresh()
+        // 4. 构建首屏快照模型
+        let snapshot = ScreenSnapshot(
+            screen: screen,
+            displayID: displayID,
+            image: displayFrame.image
+        )
+
+        // 5. 排除自身遮罩窗口
+        let excludedIDs = windows.map { CGWindowID($0.windowNumber) }
+
+        // 6. 初始化 LongCaptureService (来自 LongCaptureEngine)
+        let service = LongCaptureService(
+            snapshot: snapshot,
+            selection: localSelection,
+            excludedWindowIDs: excludedIDs
+        )
+        self.longCaptureService = service
+
+        // 7. 标记状态并设置遮罩穿透
+        session.isLongShot = true
+        setOverlayWindowsIgnoreMouse(true)
+        refresh()
+
+        // 8. 创建并展示交互悬浮条
+        let hud = LongShotHUDController()
+        hud.onFinish = { [weak self] in
+            self?.finishLongShot()
         }
-        controller.onFinish = { [weak self] image in
+        hud.onCancel = { [weak self] in
+            self?.cancelLongShot()
+        }
+
+        service.onStatus = { [weak hud] text, isError in
+            DispatchQueue.main.async {
+                if !isError {
+                    hud?.updateStatus(screenCount: 1, heightPx: 0)
+                }
+            }
+        }
+
+        service.onPreviewSegment = { [weak hud] segment, frameCount in
+            DispatchQueue.main.async {
+                hud?.updateStatus(screenCount: frameCount, heightPx: segment.previewTop + segment.previewHeight)
+            }
+        }
+
+        hud.show(near: selection, on: screen)
+        self.longShotHUDController = hud
+
+        // 9. 启动 60fps 流采集，并主动释放应用激活状态，让下层窗口即刻获得滚动焦点
+        service.start()
+        NSApp.deactivate()
+        NSLog("[ShotTool] 60fps 长截图引擎已启动，选区: \(Int(selection.width))x\(Int(selection.height))")
+    }
+
+    func finishLongShot() {
+        guard let longCaptureService else { return }
+        longShotHUDController?.showFinishing()
+        longCaptureService.finish { [weak self] result in
             guard let self else { return }
-            self.longShotController = nil
+            self.longShotHUDController?.close()
+            self.longShotHUDController = nil
+            self.longCaptureService = nil
             self.teardown()
-            if let image {
+
+            switch result {
+            case .success(let image):
                 ImageOutput.copyToPasteboard(image)
                 NSSound(named: "Glass")?.play()
-                NSLog("[ShotTool] 长截图完成 \(image.width)x\(image.height)")
+                NSLog("[ShotTool] 长截图完成，尺寸: \(image.width)x\(image.height)")
+            case .failure(let error):
+                NSLog("[ShotTool] 长截图失败: \(error.localizedDescription)")
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "长截图未成功"
+                alert.informativeText = error.localizedDescription
+                alert.addButton(withTitle: "确定")
+                alert.runModal()
             }
             self.onFinish?(nil)
         }
-        longShotController = controller
-        // 长截图要靠鼠标悬停驱动，应用必须是激活状态才收得到 mouseMoved
-        NSApp.activate(ignoringOtherApps: true)
-
-        // 让遮罩对辅助功能"透明"。
-        // 遮罩是全屏、`.screenSaver` 层级，`AXUIElementCopyElementAtPosition` 按坐标查到的
-        // 最上层元素永远是它自己 —— 一个不可滚的视图，所以兜底翻页必然报
-        // 「鼠标下没有可滚动元素」。关掉它的辅助功能可见性才能查到下面的真实元素。
-        for window in windows {
-            (window.contentView as? SelectionCanvasView)?.setAccessibilityElement(false)
-        }
-
-        // ★ 方案 B 的核心：遮罩穿透。
-        // 滚动完全交给用户自己滚，事件走真实路径直达下面的应用 ——
-        // 这是唯一能保证在任何应用（包括钉钉这类 Electron 应用）上滚动的做法。
-        // 我们不注入任何滚动事件，只用全局监听记录「滚了多少」，用来算拼接重叠。
-        setOverlayWindowsIgnoreMouse(true)
-        installGlobalScrollMonitor()
-
-        controller.start()
-        refresh()
     }
 
-    // MARK: - 长截图滚动（照 iShot 的做法）
-
-    /// 遮罩收到滚动事件：先记账，再转发给下面的页面。
-    ///
-    /// `-[MXClipView scrollWheel:]` 就是这套：`DAT_1001dde20 += deltaY` 记累积量，
-    /// 最后 `[handler handleMouseEvent:event]` 转发。这样拿到的滚动量是**真实发生**的，
-    /// 而不是「我注入了多少」——系统加速、页面到边界都能反映出来。
-    func handleLongShotScroll(_ event: NSEvent) {
-        guard session?.isLongShot == true, let controller = longShotController else { return }
-
-        // 单位：注入的是 `units: .pixel` 事件，实测 `scrollingDeltaY` 就是注入的像素值（1:1），
-        // 不能再乘 scale（乘了就翻倍，实测 1612px 超过整帧高度）。
-        // 注意 `hasPreciseScrollingDeltas` 对这个事件返回 true，不能用它区分单位。
-        let delta = event.scrollingDeltaY
-        controller.addScrollPixels(delta)
-        NSLog("[ShotTool] 记账 delta=\(Int(delta))")
-
-        // 转发给下面的窗口。
-        //
-        // 不要用「临时穿透 + cg.post」：那条路走不通。穿透要等下一个 runloop 周期才生效，
-        // 而 post 是立即投递的，事件会再次落回遮罩、被防回环标志吞掉 —— 页面根本不滚。
-        // （这就是日志里「帧数 0、状态 bottom」的原因）
-        // 直接投递给鼠标下的进程最稳。
-        guard let cg = event.cgEvent else { return }
-        if let pid = windowPIDUnderMouse() {
-            cg.postToPid(pid)
-            let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "未知"
-            NSLog("[ShotTool] 滚动已转发给 \(name)（pid \(pid)）")
-        } else {
-            NSLog("[ShotTool] 找不到鼠标下的目标窗口，滚动没有转发")
-        }
+    func cancelLongShot() {
+        longCaptureService?.cancel()
+        longCaptureService = nil
+        longShotHUDController?.close()
+        longShotHUDController = nil
+        cancel()
     }
 
-    /// 鼠标下面最上层的外部窗口进程
-    private func windowPIDUnderMouse() -> pid_t? {
-        let ownPID = ProcessInfo.processInfo.processIdentifier
-        let mouse = ScreenGeometry.cgPoint(
-            fromNS: NSEvent.mouseLocation,
-            primaryHeight: ScreenGeometry.primaryHeight
-        )
-
-        guard let list = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements],
-            kCGNullWindowID
-        ) as? [[String: Any]] else { return nil }
-
-        for info in list {
-            guard
-                let pid = info[kCGWindowOwnerPID as String] as? pid_t,
-                pid != ownPID,
-                let raw = info[kCGWindowBounds as String] as? [String: Any],
-                let x = (raw["X"] as? NSNumber)?.doubleValue,
-                let y = (raw["Y"] as? NSNumber)?.doubleValue,
-                let w = (raw["Width"] as? NSNumber)?.doubleValue,
-                let h = (raw["Height"] as? NSNumber)?.doubleValue
-            else { continue }
-
-            // 只要普通窗口层。不放宽这个条件会经常命中输入法候选框、tooltip、
-            // 各种浮层（layer != 0），把滚动投给它们等于没滚。
-            let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
-            guard layer == 0 else { continue }
-
-            // 太小的窗口（图标、状态项）不可能是滚动目标
-            guard w >= 120, h >= 120 else { continue }
-
-            if CGRect(x: x, y: y, width: w, height: h).contains(mouse) {
-                return pid
-            }
-        }
-        return nil
-    }
-
-    /// 长截图期间让遮罩不接收鼠标事件：
-    /// 轮询用的是全局鼠标位置，不需要遮罩收事件；而滚动事件必须能落到下面的页面。
+    /// 长截图期间让遮罩不接收鼠标事件：滚动事件直达下面的页面
     private func setOverlayWindowsIgnoreMouse(_ ignore: Bool) {
         for window in windows {
             window.ignoresMouseEvents = ignore
-        }
-    }
-
-    /// 全局滚动监听：遮罩穿透后收不到 scrollWheel，改用全局监听记账。
-    /// 这对应 iShot 的 `CGEventTapCreate`。
-    private func installGlobalScrollMonitor() {
-        removeGlobalScrollMonitor()
-        globalScrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
-            guard let self, let controller = self.longShotController else { return }
-
-            // 单位换算，这里是重复内容的根源：
-            // - 触控板/妙控鼠标（hasPreciseScrollingDeltas）：delta 是**点**
-            // - 传统滚轮：delta 是**行**，一行约 10pt
-            // 而重叠量是按**像素**算的，@2x 屏 1pt = 2px。
-            // 之前按 1:1 记账，重叠被算小一半，多出来的部分就是「同一段内容重复」。
-            // 单位：触控板/妙控鼠标（precise）给的是**点**，滚轮给的是**行**。
-            // 而重叠按像素算，@2x 屏 1pt = 2px —— 不换算就是重叠算大一倍，
-            // 多出来的部分就是重复内容（实测拼 8 帧高度 2155，实际该 2600+）。
-            let points: CGFloat = event.hasPreciseScrollingDeltas
-                ? event.scrollingDeltaY
-                : event.scrollingDeltaY * 10
-            controller.addScrollPixels(points * self.scale)
         }
     }
 
@@ -624,29 +585,6 @@ final class OverlayCoordinator {
         if let globalScrollMonitor {
             NSEvent.removeMonitor(globalScrollMonitor)
             self.globalScrollMonitor = nil
-        }
-    }
-
-    private func promptAccessibility() {
-        NSApp.activate(ignoringOtherApps: true)
-
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "长截图需要「辅助功能」权限"
-        alert.informativeText = """
-        这个权限只用来模拟滚轮事件做自动滚动，不会读取你敲了什么键。
-
-        请点「打开系统设置」，在「隐私与安全性 → 辅助功能」里勾选 ShotTool，然后重新截一次。
-        """
-        alert.addButton(withTitle: "打开系统设置")
-        alert.addButton(withTitle: "取消")
-
-        if alert.runModal() == .alertFirstButtonReturn {
-            LongShotService.requestAccessibility()
-            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-            if let url {
-                NSWorkspace.shared.open(url)
-            }
         }
     }
 
@@ -671,6 +609,10 @@ final class OverlayCoordinator {
     }
 
     func cancel() {
+        longShotHUDController?.close()
+        longShotHUDController = nil
+        longCaptureService?.cancel()
+        longCaptureService = nil
         teardown()
         onFinish?(nil)
     }

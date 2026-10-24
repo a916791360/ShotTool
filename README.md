@@ -243,3 +243,10 @@ ShotTool/
 - `OverlayCoordinator.crop(_:)` 是唯一的出图口，标注合成也应该挂在这里。
 - 建议按计划文档 4.3 的 `Annotation` 结构落模型 —— **带一个可选的 `semantic` 字段**，
   第二阶段做「导出成需求清单」时就不用返工。
+
+---
+
+## 开源协议
+
+本项目采用 [MIT License](LICENSE) 开源协议。
+
