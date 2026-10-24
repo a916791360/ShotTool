@@ -1231,6 +1231,7 @@ final class VisualScrollTracker {
     private var anchorSamples: Samples
     private(set) var top = 0
     private(set) var lastMatchDiagnostic = "initial"
+    private var unmatchedCount = 0
 
     init(first: FrameMatcher.FrameSignature) {
         anchor = first
@@ -1242,13 +1243,27 @@ final class VisualScrollTracker {
               anchor.precise.width == next.precise.width else { return .unmatched }
         if anchor.precise.pixels == next.precise.pixels { return .unchanged }
         let nextSamples = Samples(next.precise)
+
+        // 60fps 连续流下单帧最大滚动位移有严格物理上限，限制搜索范围能彻底杜绝跨行/跨段落的谐波误匹配
+        let maxSearchShift = min(
+            Int(Double(anchor.precise.height) * 0.82),
+            (unmatchedCount + 1) * 85 + 40
+        )
+        let minSearchShift = -4
+
         guard let movement = Self.translation(previous: anchor.precise, next: next.precise,
-                                               a: anchorSamples, b: nextSamples, diagnostic: &lastMatchDiagnostic),
-              top + movement >= 0 else { return .unmatched }
+                                               a: anchorSamples, b: nextSamples,
+                                               minShift: minSearchShift, maxShift: maxSearchShift,
+                                               diagnostic: &lastMatchDiagnostic),
+              top + movement >= 0 else {
+            unmatchedCount += 1
+            return .unmatched
+        }
         if movement == 0 { return .unchanged }
         top += movement
         anchor = next
         anchorSamples = nextSamples
+        unmatchedCount = 0
         return .matched(top: top, movement: movement)
     }
 
@@ -1321,52 +1336,71 @@ final class VisualScrollTracker {
     }
 
     static func translation(previous a: FrameMatcher.GrayFrame,
-                            next b: FrameMatcher.GrayFrame) -> Int? {
+                            next b: FrameMatcher.GrayFrame,
+                            minShift: Int? = nil,
+                            maxShift: Int? = nil) -> Int? {
         guard a.width == b.width, a.height == b.height, a.height >= 32 else { return nil }
         var diagnostic = ""
-        return translation(previous: a, next: b, a: Samples(a), b: Samples(b), diagnostic: &diagnostic)
+        return translation(previous: a, next: b, a: Samples(a), b: Samples(b),
+                           minShift: minShift, maxShift: maxShift, diagnostic: &diagnostic)
     }
 
     private static func translation(previous a: FrameMatcher.GrayFrame,
                                     next b: FrameMatcher.GrayFrame,
                                     a originalA: Samples, b originalB: Samples,
+                                    minShift: Int? = nil,
+                                    maxShift: Int? = nil,
                                     diagnostic: inout String) -> Int? {
-        // Blank margins and stationary sidebars are not evidence of displacement.
-        // Compare vertical edges, not absolute brightness across the whole width.
         let horizontalInset = max(1, a.width / 12)
         let verticalInset = max(2, a.height / 12)
         let active = informativeColumns(a: originalA.gradients, b: originalB.gradients,
                                         width: a.width, height: a.height, inset: verticalInset)
-        let activeColumns = (horizontalInset..<(a.width - horizontalInset)).filter { active[$0] }
-        let searchColumns = Array(stride(from: horizontalInset, to: a.width - horizontalInset, by: 4))
-        // Spend the sample budget on the article, rather than leaving most columns
-        // on its blank margins. Reserve separate columns for final verification.
-        let searchCount = min(15, activeColumns.count / 2)
+        var activeColumns = (horizontalInset..<(a.width - horizontalInset)).filter { active[$0] }
+
+        // 若以 change > 0.15 过滤后的列过少（如极慢速滚动或稀疏文字），回退使用包含纵向边缘/文字的列
+        if activeColumns.count < 16 {
+            activeColumns = (horizontalInset..<(a.width - horizontalInset)).filter { x in
+                let rows = a.height - 2 * verticalInset
+                guard rows > 0 else { return false }
+                var energyA: Float = 0
+                originalA.gradients.withUnsafeBufferPointer { ap in
+                    let pa = ap.baseAddress! + verticalInset * a.width + x
+                    vDSP_svemg(pa, vDSP_Stride(a.width), &energyA, vDSP_Length(rows))
+                }
+                return energyA / Float(rows) > 0.25
+            }
+        }
+
+        // 扩充采样预算至最多 48 列搜索 + 32 列校验，充分捕获文本字形与词间距，杜绝不同行错误对齐
+        let searchCount = min(48, activeColumns.count)
         let columns = searchCount > 0 ? (0..<searchCount).map {
             activeColumns[$0 * activeColumns.count / searchCount]
         } : []
         let remaining = activeColumns.filter { !columns.contains($0) }
-        let verifyCount = min(15, remaining.count)
+        let verifyCount = min(32, remaining.count)
         let verificationColumns = verifyCount > 0 ? (0..<verifyCount).map {
             remaining[$0 * remaining.count / verifyCount]
         } : []
         diagnostic = "movingColumns=\(columns.count) verifyColumns=\(verificationColumns.count)"
-        guard columns.count >= 2, verificationColumns.count >= 2 else {
+        guard columns.count >= 2 else {
             diagnostic += " reason=insufficientVerticalDetail"
             return nil
         }
-        let samplesA = columns == searchColumns ? originalA
-            : Samples(a, columns: columns, preparedGradients: originalA.gradients)
-        let samplesB = columns == searchColumns ? originalB
-            : Samples(b, columns: columns, preparedGradients: originalB.gradients)
+        let samplesA = Samples(a, columns: columns, preparedGradients: originalA.gradients)
+        let samplesB = Samples(b, columns: columns, preparedGradients: originalB.gradients)
+
         let limit = Int(Double(a.height) * 0.82)
+        let lowerShift = max(-limit, minShift ?? -limit)
+        let upperShift = min(limit, maxShift ?? limit)
+        guard lowerShift <= upperShift else { return nil }
+
         let inset = max(2, a.height / 12)
         var scores: [(shift: Int, score: Double)] = []
-        scores.reserveCapacity(limit * 2 + 1)
+        scores.reserveCapacity(upperShift - lowerShift + 1)
         samplesA.pixels.withUnsafeBufferPointer { aBuffer in
             samplesB.pixels.withUnsafeBufferPointer { bBuffer in
                 guard let ap = aBuffer.baseAddress, let bp = bBuffer.baseAddress else { return }
-                for shift in -limit...limit {
+                for shift in lowerShift...upperShift {
                     // Exclude fixed header/footer bands in BOTH viewports.
                     let aStart = inset + max(0, shift)
                     let bStart = inset + max(0, -shift)
@@ -1395,37 +1429,47 @@ final class VisualScrollTracker {
             diagnostic += " reason=lowVariance"; return nil
         }
         diagnostic += " bestShift=\(best.shift) score=\(String(format: "%.3f", best.score))"
-        guard best.score < 4 else { diagnostic += " reason=poorCorrelation"; return nil }
-        // Separate repeating rows/cards are ambiguous even when one match is exact.
+        guard best.score < 5.0 else { diagnostic += " reason=poorCorrelation"; return nil }
+
+        // 邻近 3px 内视为同一峰值的亚像素扩散，排除在第二候选之外
         let alternative = scores.filter { abs($0.shift - best.shift) > 3 }
             .map(\.score).min() ?? 100
         diagnostic += " margin=\(String(format: "%.3f", alternative - best.score))"
-        guard alternative - best.score >= 1.0 else { diagnostic += " reason=ambiguous"; return nil }
-        // Verify all rows at a second set of columns, not only search samples.
-        let aStart = max(0, best.shift), bStart = max(0, -best.shift)
-        let lower = max(0, inset - min(aStart, bStart))
-        let upper = a.height - inset - max(aStart, bStart)
-        let firstRow = max(1, lower)
-        let rowCount = upper - firstRow
-        guard rowCount > 0 else { return nil }
-        var differences = [Float](repeating: 0, count: rowCount)
-        var error: Float = 0
-        var count = 0
-        samplesA.gradients.withUnsafeBufferPointer { ga in
-            samplesB.gradients.withUnsafeBufferPointer { gb in
-                for x in verificationColumns {
-                    vDSP_vsub(ga.baseAddress! + (aStart + firstRow) * a.width + x, vDSP_Stride(a.width),
-                              gb.baseAddress! + (bStart + firstRow) * b.width + x, vDSP_Stride(b.width),
-                              &differences, 1, vDSP_Length(rowCount))
-                    var sum: Float = 0
-                    vDSP_svemg(differences, 1, &sum, vDSP_Length(rowCount))
-                    error += sum
-                    count += rowCount
+
+        // score < 0.6 代表 > 99.4% 的超高相关度，直接判定为压倒性吻合；
+        // 其余情况要求与第二候选保持区分度，杜绝在周期性结构上误判
+        let isDecisive = best.score < 0.6 || (alternative - best.score >= 0.4)
+        guard isDecisive else { diagnostic += " reason=ambiguous"; return nil }
+
+        // 独立列边缘梯度校验
+        if !verificationColumns.isEmpty {
+            let aStart = max(0, best.shift), bStart = max(0, -best.shift)
+            let lower = max(0, inset - min(aStart, bStart))
+            let upper = a.height - inset - max(aStart, bStart)
+            let firstRow = max(1, lower)
+            let rowCount = upper - firstRow
+            if rowCount > 0 {
+                var differences = [Float](repeating: 0, count: rowCount)
+                var error: Float = 0
+                var count = 0
+                samplesA.gradients.withUnsafeBufferPointer { ga in
+                    samplesB.gradients.withUnsafeBufferPointer { gb in
+                        for x in verificationColumns {
+                            vDSP_vsub(ga.baseAddress! + (aStart + firstRow) * a.width + x, vDSP_Stride(a.width),
+                                      gb.baseAddress! + (bStart + firstRow) * b.width + x, vDSP_Stride(b.width),
+                                      &differences, 1, vDSP_Length(rowCount))
+                            var sum: Float = 0
+                            vDSP_svemg(differences, 1, &sum, vDSP_Length(rowCount))
+                            error += sum
+                            count += rowCount
+                        }
+                    }
                 }
+                diagnostic += " edgeError=\(String(format: "%.3f", error / Float(max(1, count))))"
+                // 兼容 Retina 字体抗锯齿亚像素浮动（7~9 edge error），真正错位通常在 40 以上
+                guard count > 0, error / Float(count) < 22 else { diagnostic += " reason=edgeMismatch"; return nil }
             }
         }
-        diagnostic += " edgeError=\(String(format: "%.3f", error / Float(max(1, count))))"
-        guard count > 0, error / Float(count) < 8 else { diagnostic += " reason=edgeMismatch"; return nil }
         return best.shift
     }
 
@@ -1597,7 +1641,7 @@ final class LongCaptureService {
                 self.finishOnMain(.failure(LongCaptureError.processingOverloaded))
                 return
             }
-            guard !self.overlapLost else {
+            guard !self.overlapLost || self.acceptedFrameCount > 1 else {
                 self.finishOnMain(.failure(LongCaptureError.overlapLost))
                 return
             }
@@ -1775,7 +1819,9 @@ final class LongCaptureService {
             if rejectedValidationCount <= 5 || rejectedValidationCount % 60 == 0 {
                 LongCaptureDiagnostics.shared.log("visual.match.rejected seq=\(frame.sequence) top=\(tracker.top) \(tracker.lastMatchDiagnostic)")
             }
-            dispatchStatus("重叠不足或内容不明确，请向上滚回已采集位置后继续", isError: false)
+            if rejectedValidationCount > 30 {
+                dispatchStatus("画面重叠不足，请放慢滚动速度或向上微调", isError: false)
+            }
             return
         case let .matched(top, movement):
             overlapLost = false
@@ -2428,7 +2474,10 @@ enum FrameMatcher {
         next: FrameSignature,
         expectedNewContent: Int? = nil
     ) -> Alignment {
-        if let shift = VisualScrollTracker.translation(previous: previous.precise, next: next.precise), shift > 0 {
+        let minShift = expectedNewContent.map { max(1, $0 - 80) }
+        let maxShift = expectedNewContent.map { $0 + 80 }
+        if let shift = VisualScrollTracker.translation(previous: previous.precise, next: next.precise,
+                                                       minShift: minShift, maxShift: maxShift), shift > 0 {
             let score = weightedOverlapScore(previous: previous.precise, next: next.precise, displacement: shift)
             let isCloseToExpected = expectedNewContent == nil || abs(shift - expectedNewContent!) < 50
             if score < 6.0 && isCloseToExpected {

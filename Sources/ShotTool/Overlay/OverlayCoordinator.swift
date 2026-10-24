@@ -533,12 +533,14 @@ final class OverlayCoordinator {
         self.longShotHUDController = hud
 
         // 9. 启动 60fps 流采集，并主动释放应用激活状态，让下层窗口即刻获得滚动焦点
+        installGlobalScrollMonitor()
         service.start()
         NSApp.deactivate()
         NSLog("[ShotTool] 60fps 长截图引擎已启动，选区: \(Int(selection.width))x\(Int(selection.height))")
     }
 
     func finishLongShot() {
+        removeGlobalScrollMonitor()
         guard let longCaptureService else { return }
         longShotHUDController?.showFinishing()
         longCaptureService.finish { [weak self] result in
@@ -567,6 +569,7 @@ final class OverlayCoordinator {
     }
 
     func cancelLongShot() {
+        removeGlobalScrollMonitor()
         longCaptureService?.cancel()
         longCaptureService = nil
         longShotHUDController?.close()
@@ -578,6 +581,13 @@ final class OverlayCoordinator {
     private func setOverlayWindowsIgnoreMouse(_ ignore: Bool) {
         for window in windows {
             window.ignoresMouseEvents = ignore
+        }
+    }
+
+    private func installGlobalScrollMonitor() {
+        removeGlobalScrollMonitor()
+        globalScrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.scrollWheel]) { [weak self] _ in
+            guard let self, self.session?.isLongShot == true else { return }
         }
     }
 
