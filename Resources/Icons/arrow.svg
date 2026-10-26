@@ -1,4 +1,8 @@
 <svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g transform="translate(0, 48) scale(1, -1)">
+
 <path d="M19 11H37V29" stroke="#FFFFFF" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
 <path d="M11.5439 36.4559L36.9997 11" stroke="#FFFFFF" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+
+</g>
 </svg>
