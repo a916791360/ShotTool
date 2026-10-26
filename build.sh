@@ -15,6 +15,9 @@ rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 cp ".build/release/${APP_NAME}" "$BUNDLE/Contents/MacOS/${APP_NAME}"
 cp "Resources/Info.plist" "$BUNDLE/Contents/Info.plist"
+if [ -f "Resources/AppIcon.icns" ]; then
+  cp "Resources/AppIcon.icns" "$BUNDLE/Contents/Resources/AppIcon.icns"
+fi
 printf 'APPL????' > "$BUNDLE/Contents/PkgInfo"
 
 echo "==> 签名"

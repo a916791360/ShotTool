@@ -1,7 +1,10 @@
-# ShotTool · V0.1「能截」
+<p align="center">
+  <img src="Resources/AppIcon.png" width="128" height="128" alt="ShotTool App Icon" />
+</p>
 
-第一阶段骨架。对应 `../产品迭代计划-第一阶段.md` 里的 **V0.1**：能截。
-标注（V0.2）和贴图（V0.3）还没做。
+# ShotTool · V0.2「能截·能注·长截图」
+
+ShotTool 是为 macOS 精心打造的原生轻量截图与批注工具，具备高精度选区、全能标注、窗口吸附、图钉贴图以及亚像素级平滑长截图能力。
 
 ---
 
