@@ -18,6 +18,9 @@ cp "Resources/Info.plist" "$BUNDLE/Contents/Info.plist"
 if [ -f "Resources/AppIcon.icns" ]; then
   cp "Resources/AppIcon.icns" "$BUNDLE/Contents/Resources/AppIcon.icns"
 fi
+if [ -d "Resources/Icons" ]; then
+  cp -R "Resources/Icons" "$BUNDLE/Contents/Resources/"
+fi
 printf 'APPL????' > "$BUNDLE/Contents/PkgInfo"
 
 echo "==> 签名"

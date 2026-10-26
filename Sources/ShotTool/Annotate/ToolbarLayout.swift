@@ -1,6 +1,6 @@
 import AppKit
 
-enum ToolbarID: Equatable {
+enum ToolbarID: Hashable {
     case tool(AnnotationKind)
     case undo
     case redo
@@ -145,19 +145,33 @@ struct ToolbarLayout {
             }
 
             let color: NSColor = button.enabled
-                ? (isActive ? .white : NSColor(white: 1, alpha: 0.88))
+                ? (isActive ? .white : NSColor(white: 1, alpha: 0.90))
                 : NSColor(white: 1, alpha: 0.28)
 
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 14, weight: .medium),
-                .foregroundColor: color
-            ]
-            let size = (button.label as NSString).size(withAttributes: attributes)
-            let point = CGPoint(
-                x: button.rect.midX - size.width / 2,
-                y: button.rect.midY - size.height / 2
-            )
-            (button.label as NSString).draw(at: point, withAttributes: attributes)
+            if let img = ToolbarIcon.image(for: button.id) {
+                let iconSize: CGFloat = 16
+                let iconRect = CGRect(
+                    x: button.rect.midX - iconSize / 2,
+                    y: button.rect.midY - iconSize / 2,
+                    width: iconSize,
+                    height: iconSize
+                )
+                NSGraphicsContext.saveGraphicsState()
+                color.set()
+                img.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: button.enabled ? 1.0 : 0.35)
+                NSGraphicsContext.restoreGraphicsState()
+            } else {
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 14, weight: .medium),
+                    .foregroundColor: color
+                ]
+                let size = (button.label as NSString).size(withAttributes: attributes)
+                let point = CGPoint(
+                    x: button.rect.midX - size.width / 2,
+                    y: button.rect.midY - size.height / 2
+                )
+                (button.label as NSString).draw(at: point, withAttributes: attributes)
+            }
         }
     }
 }
