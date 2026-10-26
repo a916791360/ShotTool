@@ -23,6 +23,8 @@ echo "==> 3/4 安装到 $TARGET"
 rm -rf "$TARGET"
 ditto "dist/${APP_NAME}.app" "$TARGET"
 xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
+touch "$TARGET"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$TARGET" 2>/dev/null || true
 
 echo "==> 4/4 启动"
 open "$TARGET"
