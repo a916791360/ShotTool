@@ -144,7 +144,7 @@ struct ToolbarLayout {
                 ctx.fillPath()
             }
 
-            if let img = ToolbarIcon.image(for: button.id) {
+            if let cgImage = ToolbarIcon.cgImage(for: button.id) {
                 let iconSize: CGFloat = 16
                 let iconRect = CGRect(
                     x: button.rect.midX - iconSize / 2,
@@ -153,7 +153,11 @@ struct ToolbarLayout {
                     height: iconSize
                 )
                 let alpha: CGFloat = button.enabled ? (isActive ? 1.0 : 0.92) : 0.28
-                img.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: alpha)
+                ctx.saveGState()
+                ctx.setAlpha(alpha)
+                ctx.interpolationQuality = .high
+                ctx.draw(cgImage, in: iconRect)
+                ctx.restoreGState()
             } else {
                 let color: NSColor = button.enabled
                     ? (isActive ? .white : NSColor(white: 1, alpha: 0.90))

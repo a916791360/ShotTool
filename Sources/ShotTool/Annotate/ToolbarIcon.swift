@@ -94,17 +94,26 @@ final class ToolbarIcon {
         """
     ]
 
-    private static let cachedImages: [ToolbarID: NSImage] = {
-        var map: [ToolbarID: NSImage] = [:]
+    private static let cachedCGImages: [ToolbarID: CGImage] = {
+        var map: [ToolbarID: CGImage] = [:]
         for (id, svg) in svgMap {
-            if let data = svg.data(using: .utf8), let img = NSImage(data: data) {
-                map[id] = img
+            if let data = svg.data(using: .utf8),
+               let img = NSImage(data: data),
+               let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                map[id] = cg
             }
         }
         return map
     }()
 
+    static func cgImage(for id: ToolbarID) -> CGImage? {
+        cachedCGImages[id]
+    }
+
     static func image(for id: ToolbarID) -> NSImage? {
-        cachedImages[id]
+        if let data = svgMap[id]?.data(using: .utf8) {
+            return NSImage(data: data)
+        }
+        return nil
     }
 }
